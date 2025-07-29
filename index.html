@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="initial-scale=1,user-scalable=no,maximum-scale=1,width=device-width">
+  <title>Map with Search & Routing</title>
+
+  <!-- your existing CSS: -->
+  <link rel="stylesheet" href="css/leaflet.css">
+  <link rel="stylesheet" href="css/L.Control.Layers.Tree.css">
+  <link rel="stylesheet" href="css/L.Control.Locate.min.css">
+  <link rel="stylesheet" href="css/qgis2web.css">
+  <link rel="stylesheet" href="css/fontawesome-all.min.css">
+  <link rel="stylesheet" href="css/leaflet.photon.css">
+
+  <style>
+    html, body, #map { width:100%; height:100%; margin:0; padding:0; }
+    #search-wrapper, #direction-wrapper, #dropdown-wrapper {
+      position: absolute; background: white; padding:8px; border-radius:8px;
+      box-shadow:0 2px 8px rgba(0,0,0,0.3); z-index:1000;
+      display:flex; align-items:center;
+    }
+    #search-wrapper { top:10px; left:60px; }
+    #direction-wrapper { top:70px; left:290px; font-size:18px; }
+    #dropdown-wrapper { top:70px; left:60px; }
+    #search-wrapper input { width:250px; padding:6px 8px; font-size:16px; border:1px solid #ccc; border-radius:4px; }
+    #search-wrapper button { background:none; border:none; cursor:pointer; margin-left:8px; }
+    #search-wrapper button#clearBtn { margin-left:-35px; font-size:18px; }
+
+    /* bottom‑sheet styling */
+    #routeModal {
+      position:absolute; bottom:0; left:0; right:0;
+      background:white; box-shadow:0 -2px 8px rgba(0,0,0,0.3);
+      padding:16px; transform:translateY(100%); transition:transform .3s ease;
+      z-index:2000; display:flex; align-items:center; justify-content:space-between;
+    }
+    #routeModal.open { transform:translateY(0); }
+    #routeModal select, #routeModal button { padding:8px; font-size:14px; }
+    #routeModal select { width:45%; }
+  </style>
+</head>
+
+<body>
+  <!-- SEARCH -->
+  <div id="search-wrapper">
+    <input id="customSearch" placeholder="Search for buildings or roads…">
+    <button id="clearBtn">✕</button>
+    <button id="searchBtn"><img src="https://img.icons8.com/material-outlined/24/000000/search--v1.png"/></button>
+  </div>
+
+  <!-- DIRECTIONS BUTTON -->
+  <div id="direction-wrapper">
+    <button id="openRoute">Directions</button>
+  </div>
+
+  <!-- BUILDING DROPDOWN -->
+  <div id="dropdown-wrapper">
+    <select id="buildingDropdown">
+      <option value="">Select a building...</option>
+    </select>
+  </div>
+
+  <!-- MAP -->
+  <div id="map"></div>
+
+  <!-- STATIC ROUTING MODAL -->
+  <div id="routeModal">
+    <select id="startBuilding"><option value="">Start building…</option></select>
+    <select id="endBuilding"><option value="">End building…</option></select>
+    <button id="goRoute">Go</button>
+  </div>
+
+  <!-- YOUR EXISTING LIBRARIES -->
+  <script src="js/qgis2web_expressions.js"></script>
+  <script src="js/leaflet.js"></script>
+  <script src="js/L.Control.Layers.Tree.min.js"></script>
+  <script src="js/L.Control.Locate.min.js"></script>
+  <script src="js/leaflet.rotatedMarker.js"></script>
+  <script src="js/leaflet.pattern.js"></script>
+  <script src="js/leaflet-hash.js"></script>
+  <script src="js/Autolinker.min.js"></script>
+  <script src="js/rbush.min.js"></script>
+  <script src="js/labelgun.min.js"></script>
+  <script src="js/labels.js"></script>
+  <script src="js/leaflet.photon.js"></script>
+
+  <!-- YOUR DATA -->
+  <script src="data/BUILDINGS_0.js"></script>
+  <script src="data/ROADS_1.js"></script>
+
+  <script>
+  // ─────────────────────────────────────────────────────────────────
+  // 1) INIT MAP & CONTROLS
+  // ─────────────────────────────────────────────────────────────────
+  var map = L.map('map', { zoomControl:false, maxZoom:28, minZoom:1 })
+    .fitBounds([[33.921384683654864,75.01147811149058],
+               [33.93036730191615,75.03063142978719]]);
+  new L.Hash(map);
+  map.attributionControl.setPrefix(
+    '<a href="https://github.com/tomchadwin/qgis2web" target="_blank">qgis2web</a> &middot; '+
+    '<a href="https://leafletjs.com">Leaflet</a> &middot; '+
+    '<a href="https://qgis.org">QGIS</a>'
+  );
+  L.control.zoom({ position:'topleft' }).addTo(map);
+  L.control.locate({ position:'topleft', locateOptions:{ maxZoom:19 } }).addTo(map);
+
+  // ─────────────────────────────────────────────────────────────────
+  // 2) POPUPS: helper functions
+  // ─────────────────────────────────────────────────────────────────
+  function removeEmptyRows(content, feature){
+    var div = document.createElement('div');
+    div.innerHTML = content;
+    div.querySelectorAll('tr').forEach(r => {
+      var td = r.querySelector('td.visible-with-data');
+      if(td && feature.properties[td.id]==null) r.remove();
+    });
+    return div.innerHTML;
+  }
+  function addMediaClass(content, popup){
+    var div = document.createElement('div');
+    div.innerHTML = content;
+    if(div.querySelector('td img')){
+      popup._contentNode.classList.add('media');
+      setTimeout(()=>popup.update(),10);
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // 3) LAYERS: BUILDINGS
+  // ─────────────────────────────────────────────────────────────────
+  function pop_BUILDINGS_0(feature, layer){
+    var html = '<table>'+
+      '<tr><td colspan=2>'+(feature.properties.id||'')+'</td></tr>'+
+      '<tr><td colspan=2><strong>Name</strong><br/>'+(feature.properties.Name||'')+'</td></tr>'+
+      '</table>';
+    var content = removeEmptyRows(html, feature);
+    layer.on('popupopen', e => addMediaClass(content, e.popup));
+    layer.bindPopup(content, { maxHeight:400 });
+  }
+  function style_BUILDINGS(feature){
+    return { color:'#232323', weight:1, fill:true, fillColor:'#efd71b', fillOpacity:1 };
+  }
+  map.createPane('pane_BUILDINGS_0');
+  var layer_BUILDINGS_0 = L.geoJSON(json_BUILDINGS_0, {
+    pane:'pane_BUILDINGS_0',
+    onEachFeature: pop_BUILDINGS_0,
+    style: style_BUILDINGS
+  }).addTo(map);
+
+  // ─────────────────────────────────────────────────────────────────
+  // 4) LAYERS: ROADS
+  // ─────────────────────────────────────────────────────────────────
+  function pop_ROADS(feature, layer){
+    var html = '<table><tr><td colspan=2>' + (feature.properties.Name||'') + '</td></tr></table>';
+    var content = removeEmptyRows(html, feature);
+    layer.on('popupopen', e => addMediaClass(content, e.popup));
+    layer.bindPopup(content, { maxHeight:400 });
+  }
+  function style_ROADS(feature){
+    var isLink = exp_ROADS_1rule0_eval_expression({ feature:{properties:feature.properties}, variables:{} });
+    return {
+      pane:'pane_ROADS_1',
+      fill:true,
+      fillColor: isLink ? '#e4080c' : '#b2df8a',
+      fillOpacity:1,
+      stroke:false
+    };
+  }
+  map.createPane('pane_ROADS_1');
+  var layer_ROADS_1 = L.geoJSON(json_ROADS_1, {
+    pane:'pane_ROADS_1',
+    onEachFeature: pop_ROADS,
+    style: style_ROADS
+  }).addTo(map);
+
+  // ─────────────────────────────────────────────────────────────────
+  // 5) LAYER TREE
+  // ─────────────────────────────────────────────────────────────────
+  L.control.layers.tree(null, [
+  {label: 'ROADS<br /><table><tr><td style="text-align: center;"><img src="legend/ROADS_1_LINKROADS0.png" /></td><td>LINK ROADS</td></tr><tr><td style="text-align: center;"><img src="legend/ROADS_1_CARROADS1.png" /></td><td>CAR ROADS</td></tr></table>', layer: layer_ROADS_1},
+    { label:'<img src="legend/BUILDINGS_0.png"/> BUILDINGS', layer: layer_BUILDINGS_0 }
+  ], { collapsed:false }).addTo(map);
+
+   // --- Layer Tree Toggle Fix ---
+   setTimeout(function() {
+            function newLayersListHeight() {
+                var layerScrollbarElement = document.querySelector('.leaflet-control-layers-scrollbar');
+                if (layerScrollbarElement) {
+                    var layersListElement = document.querySelector('.leaflet-control-layers-list');
+                    var originalHeight = layersListElement.style.height 
+                        || window.getComputedStyle(layersListElement).height;
+                    var newHeight = parseFloat(originalHeight) - 50;
+                    layersListElement.style.height = newHeight + 'px';
+                }
+            }
+
+            var isLayersListExpanded = true;
+            var controlLayersElement = document.querySelector('.leaflet-control-layers');
+            var toggleLayerControl = document.querySelector('.leaflet-control-layers-toggle');
+
+            if (toggleLayerControl) {
+                toggleLayerControl.addEventListener('click', function() {
+                    if (isLayersListExpanded) {
+                        controlLayersElement.classList.remove('leaflet-control-layers-expanded');
+                    } else {
+                        controlLayersElement.classList.add('leaflet-control-layers-expanded');
+                    }
+                    isLayersListExpanded = !isLayersListExpanded;
+                    newLayersListHeight();
+                });
+            }
+
+            if (controlLayersElement) {
+                controlLayersElement.addEventListener('click', function(event) {
+                    var toggleLayerHeaderPointer = event.target.closest('.leaflet-layerstree-header-pointer span');
+                    if (toggleLayerHeaderPointer) {
+                        newLayersListHeight();
+                    }
+                });
+            }
+
+            toggleLayerControl?.click();
+            toggleLayerControl?.click();
+
+            var isSmallScreen = window.innerWidth < 650;
+            if (isSmallScreen) {
+                setTimeout(function() {
+                    controlLayersElement.classList.remove('leaflet-control-layers-expanded');
+                    isLayersListExpanded = false;
+                }, 500);
+            }
+        }, 100);
+  // ─────────────────────────────────────────────────────────────────
+  // 6) COLLECT FEATURES FOR SEARCH + DROPDOWN
+  // ─────────────────────────────────────────────────────────────────
+  var buildingFeatures = [];
+  layer_BUILDINGS_0.eachLayer(l => {
+    var nm = l.feature.properties.Name;
+    if(!nm) return;
+    var ctr = l.getBounds().getCenter();
+    buildingFeatures.push({ name: nm, layer: l, centroid: [ctr.lng, ctr.lat] });
+  });
+
+  // populate the “quick” building dropdown
+  var dd = document.getElementById('buildingDropdown');
+  buildingFeatures.sort((a,b)=>a.name.localeCompare(b.name)).forEach(f=>{
+    var opt = document.createElement('option');
+    opt.value = f.name; opt.text = f.name;
+    dd.appendChild(opt);
+  });
+  dd.addEventListener('change', function(){
+    var sel = this.value, bf = buildingFeatures.find(x=>x.name===sel);
+    if(!bf) return;
+    map.fitBounds(bf.layer.getBounds());
+    bf.layer.openPopup();
+    bf.layer.setStyle({ color:'#00ff00', weight:4 });
+    setTimeout(()=>layer_BUILDINGS_0.resetStyle(bf.layer),2000);
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // 7) SEARCH BOX
+  // ─────────────────────────────────────────────────────────────────
+  var allFeatures = buildingFeatures
+    .concat(layer_ROADS_1.getLayers().map(l=>({ name: l.feature.properties.Name, layer: l })));
+  document.getElementById('searchBtn').addEventListener('click', ()=>{
+    var q = document.getElementById('customSearch').value.trim().toLowerCase();
+    if(!q) return;
+    var m = allFeatures.find(x=>x.name.toLowerCase().includes(q));
+    if(!m) return alert('No match found');
+    map.fitBounds(m.layer.getBounds());
+    m.layer.openPopup();
+    m.layer.setStyle({ color:'#00ff00', weight:4 });
+    setTimeout(()=>{
+      layer_BUILDINGS_0.resetStyle(m.layer);
+      layer_ROADS_1.resetStyle(m.layer);
+    },2000);
+  });
+  document.getElementById('clearBtn').addEventListener('click', ()=>{
+    document.getElementById('customSearch').value = '';
+  });
+  document.getElementById('customSearch').addEventListener('keydown', e=>{
+    if(e.key==='Enter') document.getElementById('searchBtn').click();
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // 8) ROUTING: build Haversine‐graph from ROADS
+  // ─────────────────────────────────────────────────────────────────
+  function hav(a,b){
+    var R=6371e3, toR=Math.PI/180,
+        dLat=(b[1]-a[1])*toR, dLon=(b[0]-a[0])*toR,
+        φ1=a[1]*toR, φ2=b[1]*toR,
+        x=Math.sin(dLat/2)**2 + Math.cos(φ1)*Math.cos(φ2)*Math.sin(dLon/2)**2;
+    return 2*R*Math.atan2(Math.sqrt(x),Math.sqrt(1-x));
+  }
+  var graph = {}, coordMap = {};
+  json_ROADS_1.features.forEach(f=>{
+    f.geometry.coordinates.forEach(multi=>{
+      multi.forEach(ring=>{
+        for(var i=0;i<ring.length-1;i++){
+          var p=ring[i], q=ring[i+1],
+              k1=p[0].toFixed(6)+','+p[1].toFixed(6),
+              k2=q[0].toFixed(6)+','+q[1].toFixed(6),
+              d = hav(p,q);
+          coordMap[k1]=p; coordMap[k2]=q;
+          graph[k1]=graph[k1]||{}; graph[k2]=graph[k2]||{};
+          graph[k1][k2]=d; graph[k2][k1]=d;
+        }
+      });
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // 9) ADD BUILDING CENTROIDS TO GRAPH & POPULATE ROUTE DROPDOWNS
+  // ─────────────────────────────────────────────────────────────────
+  const routingFeatures = [];
+  buildingFeatures.forEach(b=>{
+    const key = b.centroid[0].toFixed(6)+','+b.centroid[1].toFixed(6);
+    routingFeatures.push({ name: b.name, centroid: b.centroid, key: key });
+    coordMap[key] = [b.centroid[0], b.centroid[1]];
+    graph[key] = graph[key] || {};
+
+    // connect centroid to nearest road node
+    let best = { k:null, d:Infinity };
+    for(const k in coordMap){
+      if(k===key) continue;
+      const d = hav(b.centroid, coordMap[k]);
+      if(d<best.d) best = { k,d };
+    }
+    if(best.k){
+      graph[key][best.k] = best.d;
+      graph[best.k][key] = best.d;
+    }
+  });
+
+  // populate start/end selects
+  const startSel = document.getElementById('startBuilding'),
+        endSel   = document.getElementById('endBuilding');
+  routingFeatures.sort((a,b)=>a.name.localeCompare(b.name)).forEach(r=>{
+    [startSel,endSel].forEach(sel=>{
+      const o = document.createElement('option');
+      o.value = r.name; o.text = r.name;
+      sel.appendChild(o);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // 10) DIJKSTRA’s Algorithm
+  // ─────────────────────────────────────────────────────────────────
+  function dijkstra(start, end){
+    const dist = {}, prev = {}, Q = new Set(Object.keys(graph));
+    Q.forEach(k=>dist[k]=Infinity);
+    dist[start] = 0;
+    while(Q.size){
+      let u = null;
+      Q.forEach(k=>{ if(u===null||dist[k]<dist[u]) u=k; });
+      if(u===end) break;
+      Q.delete(u);
+      for(const v in graph[u]){
+        if(!Q.has(v)) continue;
+        const alt = dist[u] + graph[u][v];
+        if(alt < dist[v]){
+          dist[v] = alt;
+          prev[v] = u;
+        }
+      }
+    }
+    const path = [], px = [];
+    let u = end;
+    while(u){
+      path.push(coordMap[u]);
+      u = prev[u];
+    }
+    return path.reverse();
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // 11) HOOK UP ROUTING UI
+  // ─────────────────────────────────────────────────────────────────
+  let routeLayer = null;
+  document.getElementById('openRoute').addEventListener('click', ()=>{
+    document.getElementById('routeModal').classList.add('open');
+  });
+  document.getElementById('goRoute').addEventListener('click', ()=>{
+    const s = startSel.value, e = endSel.value;
+    if(!s||!e) return alert('Select both start & end.');
+    const rS = routingFeatures.find(x=>x.name===s),
+          rE = routingFeatures.find(x=>x.name===e);
+    const route = dijkstra(rS.key, rE.key);
+    if(route.length<2) return alert('No route found.');
+
+    const latlngs = route.map(pt=>[pt[1],pt[0]]);
+    if(routeLayer) map.removeLayer(routeLayer);
+    routeLayer = L.polyline(latlngs,{ color:'blue', weight:5 }).addTo(map);
+    map.fitBounds(routeLayer.getBounds().pad(0.5));
+    document.getElementById('routeModal').classList.remove('open');
+  });
+  // ─────────────────────────────────────────────────────────────────
+  </script>
+</body>
+</html>
